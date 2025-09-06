@@ -1,5 +1,6 @@
 import json
 import pathlib
+import re
 import shutil
 import sys
 import tempfile
@@ -46,6 +47,10 @@ def generate_and_save_openapi_from_typescript_path(typescript_path):
 		"--to-type", "oapi",
 		"--output-extension","TYPECONV-GENERATED-FILE-OPENAPI-FILE-EXT",
 		"--output-directory", tmp_folder_path,
+
+		"--merge-objects",
+		"--strip-annotations",
+
 		ts_copy_path.name
 	], check=True, cwd=tmp_folder_path)
 
@@ -69,11 +74,12 @@ def generate_pydantic_from_openapi(openapi_path):
 	command = [
 		"datamodel-codegen",
 		"--input-file-type", "openapi",
-		"--custom-file-header", "",
+		"--custom-file-header", " ",
 		"--use-double-quotes",
 		"--input", openapi_path,
 		"--use-exact-imports",
 		"--use-title-as-name",
+		"--no-color",
 		# "--keep-model-order",
 		# "--use-schema-description",
 		"--collapse-root-models",
@@ -90,6 +96,31 @@ def generate_pydantic_from_openapi(openapi_path):
 	return result.stdout
 
 
+
+def replace_class_suffix(code, suffix, replacement):
+	esc_suffix = re.escape(suffix)
+
+	code = re.sub(
+		rf'class (\w+){esc_suffix}(\s*\(BaseModel\))',
+		rf'class \1{replacement}\2',
+		code
+	)
+
+	code = re.sub(
+		rf'(\w+){esc_suffix}\.',
+		rf'\1{replacement}.',
+		code
+	)
+
+	return code
+
+def replace_class_suffixes(code, suffixes, replacement):
+	for suffix in suffixes:
+		code = replace_class_suffix(code, suffix, replacement)
+	return code
+
+
+
 async def pb_models_to_pydantic_models(url, username, password):
 	pb = PocketBase(url)
 	await authenticate_pb(pb, username, password)
@@ -99,7 +130,12 @@ async def pb_models_to_pydantic_models(url, username, password):
 	ts_schema_path = generate_and_save_typescript_from_json_file(schema_filepath)
 	_,openapi_path = generate_and_save_openapi_from_typescript_path(ts_schema_path)
 
-	print(generate_pydantic_from_openapi(openapi_path))
+	res = generate_pydantic_from_openapi(openapi_path)
+
+	res = replace_class_suffixes(res,["Record","Records"],"")
+
+	print(res)
+
 
 
 if __name__ == "__main__":
