@@ -57,9 +57,9 @@ def generate_and_save_typescript_from_json_file(pb_schema_path):
 	with tempfile.NamedTemporaryFile(suffix=".ts", delete=True) as tf:
 		tmp_json_file_path = tf.name
 	subprocess.run([
-				"npx", "pocketbase-typegen",
-				"--json", pb_schema_path,
-				"--out", tmp_json_file_path
+		"npx", "pocketbase-typegen",
+		"--json", pb_schema_path,
+		"--out", tmp_json_file_path
 	], check=True)
 	return tmp_json_file_path
 
@@ -99,7 +99,7 @@ async def pb_models_to_pydantic_models(url, username, password):
 	ts_schema_path = generate_and_save_typescript_from_json_file(schema_filepath)
 	_,openapi_path = generate_and_save_openapi_from_typescript_path(ts_schema_path)
 
-	print(run_datamodel_codegen(openapi_path))
+	print(generate_pydantic_from_openapi(openapi_path))
 
 
 if __name__ == "__main__":
