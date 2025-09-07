@@ -70,9 +70,10 @@ def generate_pydantic_from_openapi(openapi_path):
 		"datamodel-codegen",
 		"--input-file-type", "openapi",
 		"--custom-file-header",
-					"\"\\nGenerated models file. "
-					"\\nDo not edit! "
-					"\\nChanges are not persistent\\n\"",
+					"\"\\nAuto-generated models file. "
+					"\\nDO NOT EDIT! "
+					"\\nChanges are not persistent and will "
+					"be overwritten on re-generation\\n\"",
 		"--use-double-quotes",
 		"--input", openapi_path,
 		"--use-exact-imports",
@@ -295,7 +296,12 @@ def replace_types(ast_tree, rename_map):
 #######
 
 
+
 async def pb_models_to_pydantic_models(model_out_filename, url, username, password):
+	imports = ["from datetime import datetime"]
+	type_replacements = {"IsoDateString":"datetime"}
+
+
 	pb = PocketBase(url)
 	await authenticate_pb(pb, username, password)
 	pb_schema = await get_pb_schema(pb)
@@ -311,8 +317,8 @@ async def pb_models_to_pydantic_models(model_out_filename, url, username, passwo
 	ast_tree = ast.parse(code)
 	replace_class_suffixes(ast_tree, {"Record": "", "Records": ""})
 	remove_config_classes(ast_tree)
-	add_imports(ast_tree,["from datetime import datetime"])
-	replace_types(ast_tree, {"IsoDateString":"datetime"})
+	add_imports(ast_tree,imports)
+	replace_types(ast_tree, type_replacements)
 
 	classnames_original_collection_names = get_classnames_original_collection_names(ast_tree)
 	remove_classes(ast_tree, ["Collection"])
