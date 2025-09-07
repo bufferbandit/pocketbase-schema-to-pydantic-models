@@ -1,7 +1,6 @@
 import ast
 import json
 import pathlib
-import re
 import shutil
 import sys
 import tempfile
@@ -19,7 +18,6 @@ async def authenticate_pb(pb: PocketBase, email, password):
 async def get_pb_schema(pb: PocketBase, include_system = False):
 	return await pb.collections.get_full_list({"filter": f"system = {str(include_system).lower()}"})
 
-
 def write_pb_schema_to_tmpfile(pb_schema_data):
 	with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as pb_schema_file:
 		pb_schema_file.write(json.dumps(pb_schema_data))
@@ -28,7 +26,6 @@ def write_pb_schema_to_tmpfile(pb_schema_data):
 	return pb_schema_filepath
 
 ######
-
 
 def generate_and_save_openapi_from_typescript_path(typescript_path):
 	ts_path = pathlib.Path(typescript_path)
@@ -58,7 +55,6 @@ def generate_and_save_openapi_from_typescript_path(typescript_path):
 	yaml_files = list(tmp_folder_path.glob("*.TYPECONV-GENERATED-FILE-OPENAPI-FILE-EXT"))
 	return tmp_dir, str(yaml_files[0])
 
-
 def generate_and_save_typescript_from_json_file(pb_schema_path):
 	with tempfile.NamedTemporaryFile(suffix=".ts", delete=True) as tf:
 		tmp_json_file_path = tf.name
@@ -69,13 +65,14 @@ def generate_and_save_typescript_from_json_file(pb_schema_path):
 	], check=True)
 	return tmp_json_file_path
 
-
 def generate_pydantic_from_openapi(openapi_path):
 	command = [
 		"datamodel-codegen",
 		"--input-file-type", "openapi",
 		"--custom-file-header",
-					"\"\\nGenerated models file. \\nDo not edit! \\nChanges are not persistent\\n\"",
+					"\"\\nGenerated models file. "
+					"\\nDo not edit! "
+					"\\nChanges are not persistent\\n\"",
 		"--use-double-quotes",
 		"--input", openapi_path,
 		"--use-exact-imports",
@@ -84,8 +81,11 @@ def generate_pydantic_from_openapi(openapi_path):
 		# "--keep-model-order",
 		# "--use-schema-description",
 		# "--use-unique-items-as-set",
-		"--collapse-root-models",
 		"--strip-default-none",
+
+
+		# "--collapse-root-models",
+
 		# "--snake-case-field",
 		"--target-python-version", ".".join(sys.version.split()[0].split(".")[:2]),
 	]
@@ -99,13 +99,20 @@ def generate_pydantic_from_openapi(openapi_path):
 
 	return result.stdout
 
-
 def remove_classes(ast_tree, classes):
 	ast_tree.body = [
 		node for node in ast_tree.body
 		if not (isinstance(node, ast.ClassDef) and node.name in classes)
 	]
-	return ast.unparse(ast_tree)
+	return ast_tree
+
+def remove_classes_with_suffixes(ast_tree, suffixes):
+	ast_tree.body = [
+		node for node in ast_tree.body
+		if not (isinstance(node, ast.ClassDef) and any(node.name.endswith(suf) for suf in suffixes))
+	]
+	ast.fix_missing_locations(ast_tree)
+	return ast_tree
 
 def replace_class_suffixes(ast_tree, sufix_map):
 	for node in ast.walk(ast_tree):
@@ -114,7 +121,7 @@ def replace_class_suffixes(ast_tree, sufix_map):
 				if node.name.endswith(old):
 					node.name = node.name[: -len(old)] + new
 					break
-	return ast.unparse(ast_tree)
+	return ast_tree
 
 def wire_pbschema_references(pb_schema):
 	lookup = {col["id"]: col for col in pb_schema}
@@ -127,102 +134,168 @@ def wire_pbschema_references(pb_schema):
 					field["collectionRef"] = lookup[parent_id]
 	return pb_schema
 
-def replace_pbschema_child_types(ast_tree, pb_schema_with_references):
+def remove_config_classes(ast_tree):
 	"""
-	For each ClassDef in ast_tree whose name exists in pb_schema_with_references,
-	find class-level annotated fields (AnnAssign). If a field is a relation in the
-	schema and points to another collection, replace only the inner type that
-	equals a placeholder type (e.g. str) with the target collection class name,
-	preserving wrappers like Optional[...] or List[...].
+	Remove all inner 'Config' classes from the datamodels for increased readability
 	"""
+	for cls in ast.walk(ast_tree):
+		if not isinstance(cls, ast.ClassDef):
+			continue
+		# Filter out inner classes named 'Config'
+		cls.body = [stmt for stmt in cls.body
+					if not (isinstance(stmt, ast.ClassDef) and stmt.name == "Config")]
+	ast.fix_missing_locations(ast_tree)
+	return ast_tree
 
-	# lookups
-	name_lookup = {col["name"]: col for col in pb_schema_with_references if "name" in col}
-	id_to_name = {col["id"]: col["name"] for col in pb_schema_with_references if "id" in col}
+def add_imports(ast_tree, import_lines):
+	# Parse each line into AST nodes
+	import_nodes = []
+	for line in import_lines:
+		parsed = ast.parse(line).body
+		for node in parsed:
+			if isinstance(node, (ast.Import, ast.ImportFrom)):
+				import_nodes.append(node)
 
-	def ref_to_name(ref):
-		"""Return collection name from collectionRef which may be dict with name or id."""
-		if isinstance(ref, dict):
-			if "name" in ref:
-				return ref["name"]
-			if "id" in ref and ref["id"] in id_to_name:
-				return id_to_name[ref["id"]]
-		return None
+	# Find the index after the last existing import
+	last_import_idx = -1
+	for i, stmt in enumerate(ast_tree.body):
+		if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+			last_import_idx = i
 
-	def replace_inner(node, new_name):
-		"""Recursively replace str annotations inside node with new_name."""
-		if node is None:
-			return node
+	# Insert new imports right after existing ones
+	insert_idx = last_import_idx + 1
+	ast_tree.body[insert_idx:insert_idx] = import_nodes
+	ast.fix_missing_locations(ast_tree)
+	return ast_tree
 
-		# Replace direct str -> new_name
+def rename_classes(ast_tree, rename_map):
+	"""
+	Rename classes in the AST.
+	rename_map: dict mapping old class names to new class names, e.g. {"Old": "New"}
+	"""
+	for node in ast.walk(ast_tree):
+		if isinstance(node, ast.ClassDef):
+			if node.name in rename_map:
+				node.name = rename_map[node.name]
+
+		# Also rename references in annotations if needed
 		if isinstance(node, ast.Name):
-			if node.id == "str":
-				return ast.copy_location(ast.Name(id=new_name, ctx=ast.Load()), node)
-			return node
+			if node.id in rename_map:
+				node.id = rename_map[node.id]
 
-		if isinstance(node, ast.Attribute):
-			if node.attr == "str":
-				return ast.copy_location(ast.Name(id=new_name, ctx=ast.Load()), node)
-			return node
+	ast.fix_missing_locations(ast_tree)
+	return ast_tree
 
+
+def replace_relation_annotations(ast_tree, pb_schema_with_references, classnames_original_collection_names):
+	"""
+	Recursively replace all occurrences of RecordIdString in type annotations
+	with int, preserving wrappers like Optional and List.
+	"""
+
+	reversed_dict = {v: k for k, v in classnames_original_collection_names.items()}
+
+	def recursive_replace(node, field_name, parent_class):
+
+		# Base case: replace RecordIdString → int
+		if isinstance(node, ast.Name) and node.id == "RecordIdString":
+			original_collection_name = reversed_dict[parent_class.name]
+			parent_original_schema = next(x for x in pb_schema_with_references if x["name"] == original_collection_name)
+
+			parent_fields = parent_original_schema["fields"]
+			field_original_schema = next(filter(lambda f: f["name"] == field_name, parent_fields))
+
+
+			# pattern
+			# min
+			# max
+			# system
+			# hidden
+			# presentatble
+			# autogeneratePattern
+			# type
+
+
+			schema_collection_ref = field_original_schema.get("collectionRef")
+			schema_collection_name = schema_collection_ref["name"]
+			class_name = classnames_original_collection_names[schema_collection_name]
+			return ast.Name(id=class_name, ctx=ast.Load())
+
+		# Handle subscripted types (Optional[T], List[T], etc.)
 		if isinstance(node, ast.Subscript):
-			new_slice = node.slice
-			if isinstance(new_slice, ast.Index):  # <3.9
-				new_inner = replace_inner(new_slice.value, new_name)
-				new_slice = ast.copy_location(ast.Index(value=new_inner), new_slice)
-			else:  # >=3.9
-				new_slice = replace_inner(new_slice, new_name)
-			return ast.copy_location(
-				ast.Subscript(value=node.value, slice=new_slice, ctx=node.ctx),
-				node,
-			)
+			node.value = recursive_replace(node.value, field_name, parent_class)
+			# Python <3.9
+			if isinstance(node.slice, ast.Index):
+				node.slice.value = recursive_replace(node.slice.value, field_name, parent_class)
+			else:  # Python 3.9+
+				node.slice = recursive_replace(node.slice, field_name, parent_class)
+			return node
 
-		if isinstance(node, ast.Tuple):
-			new_elts = [replace_inner(e, new_name) for e in node.elts]
-			ctx = getattr(node, "ctx", ast.Load())
-			return ast.copy_location(ast.Tuple(elts=new_elts, ctx=ctx), node)
-
-		if isinstance(node, ast.List):
-			new_elts = [replace_inner(e, new_name) for e in node.elts]
-			ctx = getattr(node, "ctx", ast.Load())
-			return ast.copy_location(ast.List(elts=new_elts, ctx=ctx), node)
+		# Handle tuple/list of types (e.g., Union)
+		if isinstance(node, (ast.Tuple, ast.List)):
+			node.elts = [recursive_replace(e,field_name, parent_class) for e in node.elts]
+			return node
 
 		return node
 
-	for node in ast.walk(ast_tree):
-		if not isinstance(node, ast.ClassDef):
+	for cls in ast.walk(ast_tree):
+		if not isinstance(cls, ast.ClassDef):
 			continue
-		if node.name not in name_lookup:
-			continue
-
-		schema = name_lookup[node.name]
-		field_map = {f["name"]: f for f in schema.get("fields", []) if "name" in f}
-
-		for class_stmt in node.body:
-			if not isinstance(class_stmt, ast.AnnAssign):
+		parent_class = cls
+		for stmt in cls.body:
+			if not isinstance(stmt, ast.AnnAssign):
 				continue
-
-			if isinstance(class_stmt.target, ast.Name):
-				varname = class_stmt.target.id
-			elif isinstance(class_stmt.target, ast.Attribute):
-				varname = class_stmt.target.attr
-			else:
-				continue
-
-			field = field_map.get(varname)
-			if not field or field.get("type") != "relation" or not field.get("collectionRef"):
-				continue
-
-			target_class = ref_to_name(field["collectionRef"])
-			if not target_class:
-				continue
-
-			class_stmt.annotation = replace_inner(class_stmt.annotation, target_class)
+			field_name = getattr(stmt.target, "id", None) or getattr(stmt.target, "attr", None)
+			stmt.annotation = recursive_replace(stmt.annotation, field_name, parent_class)
 
 	ast.fix_missing_locations(ast_tree)
-	return ast.unparse(ast_tree)
+	return ast_tree
 
-async def pb_models_to_pydantic_models(url, username, password):
+
+def get_classnames_original_collection_names(ast_tree):
+	"""
+	Finds the class named 'Collection' and returns a mapping:
+	attribute name → class name with 'Record' suffix removed.
+	Example: {'Child': 'Child', 'Parent': 'Parent', ...}
+	"""
+	mapping = {}
+
+	for cls in ast.walk(ast_tree):
+		if isinstance(cls, ast.ClassDef) and cls.name == "Collection":
+			for stmt in cls.body:
+				if isinstance(stmt, ast.AnnAssign):
+					attr_name = getattr(stmt.target, "id", None) or getattr(stmt.target, "attr", None)
+					# Get type name and remove 'Record' suffix
+					type_name = None
+					if isinstance(stmt.annotation, ast.Name):
+						type_name = stmt.annotation.id
+					elif isinstance(stmt.annotation, ast.Subscript):
+						# e.g., Optional[ChildRecord] or List[ChildRecord]
+						sub = stmt.annotation
+						if isinstance(sub.slice, ast.Index):  # Python <3.9
+							type_node = sub.slice.value
+						else:  # Python 3.9+
+							type_node = sub.slice
+						if isinstance(type_node, ast.Name):
+							type_name = type_node.id
+					if type_name and type_name.endswith("Record"):
+						type_name = type_name[:-len("Record")]
+					mapping[attr_name] = type_name
+			break
+
+	return mapping
+
+
+def replace_types(ast_tree, rename_map):
+	for k,v in rename_map.items():
+		remove_classes(ast_tree, [k])
+		rename_classes(ast_tree, {k:v})
+
+
+#######
+
+
+async def pb_models_to_pydantic_models(model_out_filename, url, username, password):
 	pb = PocketBase(url)
 	await authenticate_pb(pb, username, password)
 	pb_schema = await get_pb_schema(pb)
@@ -237,15 +310,27 @@ async def pb_models_to_pydantic_models(url, username, password):
 
 	ast_tree = ast.parse(code)
 	replace_class_suffixes(ast_tree, {"Record": "", "Records": ""})
-	replace_pbschema_child_types(ast_tree, pb_schema_with_references)
-	res4 = remove_classes(ast_tree, ["TypedPocketBase", "CollectionResponses","Collection"])
+	remove_config_classes(ast_tree)
+	add_imports(ast_tree,["from datetime import datetime"])
+	replace_types(ast_tree, {"IsoDateString":"datetime"})
 
-	print(res4)
+	classnames_original_collection_names = get_classnames_original_collection_names(ast_tree)
+	remove_classes(ast_tree, ["Collection"])
+
+	replace_relation_annotations(ast_tree, pb_schema_with_references, classnames_original_collection_names)
+
+	remove_classes(ast_tree, ["TypedPocketBase", "CollectionResponses","RecordIdString"])
+	remove_classes_with_suffixes(ast_tree,["Response"])
+
+	out_transformed_ast = ast.unparse(ast_tree)
+	with open(model_out_filename, "w", encoding="utf-8") as f:
+		f.write(out_transformed_ast)
 
 
 if __name__ == "__main__":
 
 	asyncio.run(pb_models_to_pydantic_models(
+		MODEL_OUT_FILENAME,
 		CONNECTION_URL,
 		SUPERUSER_EMAIL,
 		SUPERUSER_PASSWORD
